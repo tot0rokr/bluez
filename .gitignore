@@ -1,3 +1,5 @@
+cscope.*
+tags
 *.o
 *.a
 *.lo
