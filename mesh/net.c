@@ -30,6 +30,11 @@
 #include "mesh/model.h"
 #include "mesh/appkey.h"
 #include "mesh/rpl.h"
+#include "mesh/mesh.h"
+
+#ifndef MIN
+#define MIN(x, y) ((x) < (y) ? (x) : (y))
+#endif
 
 #define abs_diff(a, b) ((a) > (b) ? (a) - (b) : (b) - (a))
 
@@ -90,15 +95,34 @@ struct mesh_subnet {
 	uint8_t kr_phase;
 };
 
+struct mesh_sar_transmitter {
+	uint8_t	seg_int_step;
+	uint8_t	unicast_rtx_cnt;
+	uint8_t	unicast_rtx_without_prog_cnt;
+	uint8_t	unicast_rtx_int_step;
+	uint8_t	unicast_rtx_int_inc;
+	uint8_t	multicast_rtx_cnt;
+	uint8_t	multicast_rtx_int_step;
+};
+
+struct mesh_sar_receiver {
+	uint8_t	seg_threshold;
+	uint8_t	ack_delay_inc;
+	uint8_t	ack_rtx_cnt;
+	uint8_t	discard_timeout;
+	uint8_t	receiver_seg_int_step;
+};
+
 struct mesh_net {
 	struct mesh_io *io;
 	struct mesh_node *node;
 	struct mesh_prov *prov;
 	struct l_queue *app_keys;
+	struct mesh_sar_transmitter *sar_txr;
+	struct mesh_sar_receiver *sar_rxr;
 	unsigned int pkt_id;
 	unsigned int bea_id;
 	unsigned int beacon_id;
-	unsigned int sar_id_next;
 
 	bool friend_enable;
 	bool beacon_enable;
@@ -135,7 +159,6 @@ struct mesh_net {
 	struct l_queue *replay_cache;
 	struct l_queue *sar_in;
 	struct l_queue *sar_out;
-	struct l_queue *sar_queue;
 	struct l_queue *frnd_msgs;
 	struct l_queue *friends;
 	struct l_queue *negotiations;
@@ -219,6 +242,65 @@ struct net_beacon_data {
 
 static struct l_queue *fast_cache;
 static struct l_queue *nets;
+
+static uint8_t sar_tx_seg_int_ms(struct mesh_sar_transmitter *txr)
+{
+	return (txr->seg_int_step + 1) * 10;
+}
+
+static uint8_t sar_tx_retrans_cnt(struct mesh_sar_transmitter *txr,
+					bool is_unicast, bool no_progress)
+{
+	if (is_unicast) {
+		return (no_progress ?
+			txr->unicast_rtx_without_prog_cnt :
+			txr->unicast_rtx_cnt);
+	} else {
+		return txr->multicast_rtx_cnt;
+	}
+}
+
+/* Maximum retransmission interval is 50800 milliseconds. */
+static uint16_t sar_tx_retrans_timeout_ms(struct mesh_sar_transmitter *txr,
+						bool is_unicast, int ttl)
+{
+	if (is_unicast) {
+		return (txr->unicast_rtx_int_step + 1 + ((ttl > 0) ?
+			 ((txr->unicast_rtx_int_inc + 1) * (ttl - 1)) :
+								0)) * 25;
+	} else {
+		return (txr->multicast_rtx_int_step + 1) * 25;
+	}
+}
+
+static uint8_t sar_rx_seg_threshold(struct mesh_sar_receiver *rxr)
+{
+	return rxr->seg_threshold;
+}
+
+/* Maximum ack retransmission interval is 1360 milliseconds. */
+static uint16_t sar_rx_ack_timeout_ms(struct mesh_sar_receiver *rxr, int segN)
+{
+	return MIN(segN, rxr->ack_delay_inc * 2 + 3) *
+			(rxr->receiver_seg_int_step + 1) * 10 / 2;
+}
+
+/* Maximum retransmission delay is 1360 milliseconds. */
+static uint16_t sar_rx_delay_ack_timeout_ms(struct mesh_sar_receiver *rxr)
+{
+	return (rxr->ack_delay_inc * 2 + 3) *
+			(rxr->receiver_seg_int_step + 1) * 10 / 2;
+}
+
+static uint8_t sar_rx_discard_timeout(struct mesh_sar_receiver *rxr)
+{
+	return (rxr->discard_timeout + 1) * 5;
+}
+
+static uint8_t sar_rx_ack_retrans_count(struct mesh_sar_receiver *rxr)
+{
+	return rxr->ack_rtx_cnt;
+}
 
 static void net_rx(void *net_ptr, void *user_data);
 
@@ -516,9 +598,52 @@ static void mesh_sar_free(void *data)
 	if (!sar)
 		return;
 
-	l_timeout_remove(sar->seg_timeout);
-	l_timeout_remove(sar->msg_timeout);
 	l_free(sar);
+}
+
+static struct mesh_sar_tx *mesh_sar_tx_new()
+{
+	size_t size = sizeof(struct mesh_sar_tx);
+	struct mesh_sar_tx *sar_tx;
+
+	sar_tx = l_malloc(size);
+	memset(sar_tx, 0, size);
+	return sar_tx;
+}
+
+static void mesh_sar_tx_free(void *data)
+{
+	struct mesh_sar_tx *sar_tx = data;
+
+	if (!sar_tx)
+		return;
+
+	mesh_sar_free(sar_tx->sar);
+	l_timeout_remove(sar_tx->seg_timeout);
+	l_free(sar_tx);
+}
+
+static struct mesh_sar_rx *mesh_sar_rx_new()
+{
+	size_t size = sizeof(struct mesh_sar_rx);
+	struct mesh_sar_rx *sar_rx;
+
+	sar_rx = l_malloc(size);
+	memset(sar_rx, 0, size);
+	return sar_rx;
+}
+
+static void mesh_sar_rx_free(void *data)
+{
+	struct mesh_sar_rx *sar_rx = data;
+
+	if (!sar_rx)
+		return;
+
+	mesh_sar_free(sar_rx->sar);
+	l_timeout_remove(sar_rx->ack_timeout);
+	l_timeout_remove(sar_rx->msg_timeout);
+	l_free(sar_rx);
 }
 
 static void subnet_free(void *data)
@@ -609,6 +734,11 @@ struct mesh_net *mesh_net_new(struct mesh_node *node)
 
 	net = l_new(struct mesh_net, 1);
 
+	net->sar_txr = l_new(struct mesh_sar_transmitter, 1);
+	mesh_get_sar_transmitter(&net->sar_txr);
+	net->sar_rxr = l_new(struct mesh_sar_receiver, 1);
+	mesh_get_sar_receiver(&net->sar_rxr);
+
 	net->node = node;
 	net->seq_num = DEFAULT_SEQUENCE_NUMBER;
 	net->default_ttl = TTL_MASK;
@@ -620,7 +750,6 @@ struct mesh_net *mesh_net_new(struct mesh_node *node)
 	net->msg_cache = l_queue_new();
 	net->sar_in = l_queue_new();
 	net->sar_out = l_queue_new();
-	net->sar_queue = l_queue_new();
 	net->frnd_msgs = l_queue_new();
 	net->destinations = l_queue_new();
 	net->app_keys = l_queue_new();
@@ -642,12 +771,14 @@ void mesh_net_free(void *user_data)
 	if (!net)
 		return;
 
+	l_free(net->sar_txr);
+	l_free(net->sar_rxr);
+
 	l_queue_destroy(net->subnets, subnet_free);
 	l_queue_destroy(net->msg_cache, l_free);
 	l_queue_destroy(net->replay_cache, l_free);
-	l_queue_destroy(net->sar_in, mesh_sar_free);
-	l_queue_destroy(net->sar_out, mesh_sar_free);
-	l_queue_destroy(net->sar_queue, mesh_sar_free);
+	l_queue_destroy(net->sar_in, mesh_sar_rx_free);
+	l_queue_destroy(net->sar_out, mesh_sar_tx_free);
 	l_queue_destroy(net->frnd_msgs, l_free);
 	l_queue_destroy(net->friends, mesh_friend_free);
 	l_queue_destroy(net->negotiations, mesh_friend_free);
@@ -1052,36 +1183,52 @@ static bool msg_in_cache(struct mesh_net *net, uint16_t src, uint32_t seq,
 	return false;
 }
 
-static bool match_sar_seq0(const void *a, const void *b)
+static bool match_sar_tx_seq0(const void *a, const void *b)
 {
-	const struct mesh_sar *sar = a;
+	const struct mesh_sar_tx *sar_tx = a;
 	uint16_t seqZero = L_PTR_TO_UINT(b);
 
-	return sar->seqZero == seqZero;
+	return sar_tx->sar->seqZero == seqZero;
 }
 
-static bool match_sar_remote(const void *a, const void *b)
+static bool match_sar_tx_remote(const void *a, const void *b)
 {
-	const struct mesh_sar *sar = a;
+	const struct mesh_sar_tx *sar_tx = a;
 	uint16_t remote = L_PTR_TO_UINT(b);
 
-	return sar->remote == remote;
+	return sar_tx->sar->remote == remote;
+}
+
+static bool match_sar_rx_remote(const void *a, const void *b)
+{
+	const struct mesh_sar_rx *sar_rx = a;
+	uint16_t remote = L_PTR_TO_UINT(b);
+
+	return sar_rx->sar->remote == remote;
 }
 
 static bool match_msg_timeout(const void *a, const void *b)
 {
-	const struct mesh_sar *sar = a;
+	const struct mesh_sar_rx *sar_rx = a;
 	const struct l_timeout *msg_timeout = b;
 
-	return sar->msg_timeout == msg_timeout;
+	return sar_rx->msg_timeout == msg_timeout;
+}
+
+static bool match_ack_timeout(const void *a, const void *b)
+{
+	const struct mesh_sar_rx *sar_rx = a;
+	const struct l_timeout *ack_timeout = b;
+
+	return sar_rx->ack_timeout == ack_timeout;
 }
 
 static bool match_seg_timeout(const void *a, const void *b)
 {
-	const struct mesh_sar *sar = a;
+	const struct mesh_sar_tx *sar_tx = a;
 	const struct l_timeout *seg_timeout = b;
 
-	return sar->seg_timeout == seg_timeout;
+	return sar_tx->seg_timeout == seg_timeout;
 }
 
 static bool match_dest_dst(const void *a, const void *b)
@@ -1729,7 +1876,7 @@ static bool msg_rxed(struct mesh_net *net, bool frnd, uint32_t iv_index,
 			hdr |= (uint32_t) 0x01 << SEG_HDR_SHIFT;
 			hdr |= szmic << SZMIC_HDR_SHIFT;
 			hdr |= (seqZero & SEQ_ZERO_MASK) << SEQ_ZERO_HDR_SHIFT;
-			hdr |= SEG_MAX(true, size) << SEGN_HDR_SHIFT;
+			hdr |= SEG_MAX(false, true, size) << SEGN_HDR_SHIFT;
 		}
 
 		if (friend_packet_queue(net, iv_index, false, frnd_ttl,
@@ -2342,12 +2489,18 @@ static enum _relay_advice packet_received(void *user_data,
 					friend_ack_rxed(net, iv_index, net_seq,
 							net_src, net_dst, msg);
 				else
-					ack_received(net, false,
-							net_src, net_dst,
+					ack_rxed(net, net_src, net_dst,
 							net_seqZero,
 							l_get_be32(msg + 3));
+			} else if (net_segmented) {
+				seg_rxed(net, false, iv_index, net_ttl,
+						net_seq, net_idx, net_src,
+						net_dst, net_ctl, net_opcode,
+						key_aid, net_szmic, net_seqZero,
+						net_segO, net_segN,
+						msg, app_msg_len);
 			} else {
-				ctl_received(net, net_key_id, iv_index, net_ttl,
+				ctl_rxed(net, net_key_id, iv_index, net_ttl,
 						net_seq, net_src, net_dst,
 						net_opcode, rssi, msg,
 								app_msg_len);
@@ -2370,18 +2523,19 @@ static enum _relay_advice packet_received(void *user_data,
 						msg, app_msg_len);
 				}
 			} else {
-				seg_rxed(net, NULL, iv_index, net_ttl,
+				seg_rxed(net, false, iv_index, net_ttl,
 						net_seq, net_idx, net_src,
-						net_dst, key_aid, net_szmic,
-						net_seqZero, net_segO, net_segN,
+						net_dst, net_ctl, net_opcode,
+						key_aid, net_szmic, net_seqZero,
+						net_segO, net_segN,
 						msg, app_msg_len);
 			}
 
 		} else {
-			msg_rxed(net, NULL, iv_index, net_ttl, net_seq, net_idx,
-					net_src, net_dst, key_aid, false,
-					false, net_seq & SEQ_ZERO_MASK, msg,
-					app_msg_len);
+			msg_rxed(net, false, iv_index, net_ttl, net_seq,
+					net_idx, net_src, net_dst, key_aid,
+					false, false, net_seq & SEQ_ZERO_MASK,
+					msg, app_msg_len);
 		}
 
 		/* If this is one of our Unicast addresses, disallow relay */
@@ -2493,8 +2647,7 @@ static void iv_upd_to(struct l_timeout *upd_timeout, void *user_data)
 
 	switch (net->iv_upd_state) {
 	case IV_UPD_UPDATING:
-		if (l_queue_length(net->sar_out) ||
-					l_queue_length(net->sar_queue)) {
+		if (l_queue_length(net->sar_out)) {
 			l_debug("don't leave IV Update until sar_out empty");
 			l_timeout_modify(net->iv_update_timeout, 10);
 			break;
@@ -2998,16 +3151,16 @@ static bool send_seg(struct mesh_net *net, uint8_t cnt, uint16_t interval,
 	uint8_t gatt_data[30];
 	uint8_t *packet = gatt_data;
 	uint8_t packet_len;
-	uint8_t segN = SEG_MAX(msg->segmented, msg->len);
-	uint16_t seg_off = SEG_OFF(segO);
+	uint8_t segN = SEG_MAX(msg->ctl, msg->segmented, msg->len);
+	uint16_t seg_off = SEG_OFF(msg->ctl, segO);
 	uint32_t seq_num;
 
 	if (msg->segmented) {
 		/* Send each segment on unique seq_num */
 		seq_num = mesh_net_next_seq_num(net);
 
-		if (msg->len - seg_off > SEG_OFF(1))
-			seg_len = SEG_OFF(1);
+		if (msg->len - seg_off > SEG_OFF(msg->ctl, 1))
+			seg_len = SEG_OFF(msg->ctl, 1);
 		else
 			seg_len = msg->len - seg_off;
 	} else {
@@ -3023,12 +3176,12 @@ static bool send_seg(struct mesh_net *net, uint8_t cnt, uint16_t interval,
 	l_debug("segN %d segment %d seg_off %d", segN, segO, seg_off);
 
 	/* TODO: Are we RXing on an LPN's behalf? Then set RLY bit */
-	if (!mesh_crypto_packet_build(false, msg->ttl, seq_num, msg->src,
-					msg->remote, 0, msg->segmented,
-					msg->key_aid, msg->szmic, false,
-					msg->seqZero, segO, segN,
-					msg->buf + seg_off, seg_len,
-					packet + 1, &packet_len)) {
+	if (!mesh_crypto_packet_build(msg->ctl, msg->ttl, seq_num, msg->src,
+					msg->remote, msg->opcode,
+					msg->segmented, msg->key_aid,
+					msg->szmic, false, msg->seqZero,
+					segO, segN, msg->buf + seg_off,
+					seg_len, packet + 1, &packet_len)) {
 		l_error("Failed to build packet");
 		return false;
 	}
@@ -3048,9 +3201,63 @@ static bool send_seg(struct mesh_net *net, uint8_t cnt, uint16_t interval,
 
 	send_msg_pkt(net, cnt, interval, packet, packet_len + 1);
 
-	msg->last_seg = segO;
-
 	return true;
+}
+
+static bool mesh_net_send(struct mesh_net *net, struct mesh_sar *payload,
+								uint8_t segN)
+{
+	bool result = false;
+
+	if (payload->segmented) {
+		struct mesh_sar_tx *drop_sar_tx;
+		payload->flags = 0xffffffff >> (31 - segN);
+		payload->seqZero = payload->seqAuth & SEQ_ZERO_MASK;
+
+		/* Single thread SAR messages to same Unicast DST */
+		drop_sar_tx = l_queue_find(net->sar_out, match_sar_tx_remote,
+						L_UINT_TO_PTR(payload->remote));
+		if (drop_sar_tx) {
+			/* Cancel incomplete prior SAR on the same dst */
+			l_debug("Cancel incompleted SAR: SeqZero %4.4x",
+					drop_sar_tx->sar->seqZero);
+			l_queue_remove(net->sar_out, drop_sar_tx);
+			mesh_sar_tx_free(drop_sar_tx);
+			return true;
+		}
+	}
+
+	result = send_seg(net, net->tx_cnt, net->tx_interval, payload, 0);
+
+	/*
+	 * Set the timeout to send the next seg or retransmit if the payload is
+	 * segmented. Flush if it is not segmented or if the transmission
+	 * failed.
+	 */
+	if (result && payload->segmented) {
+		struct mesh_sar_tx *sar_tx = mesh_sar_tx_new();
+		bool is_unicast = IS_UNICAST(payload->remote);
+		sar_tx->ack_received = false;
+		sar_tx->int_ms = sar_tx_seg_int_ms(net->sar_txr);
+		sar_tx->attempt_left = sar_tx_retrans_cnt(net->sar_txr,
+							is_unicast, false);
+		sar_tx->attempt_left_no_progress = sar_tx_retrans_cnt(
+							net->sar_txr,
+							is_unicast, true);
+		sar_tx->retrans_ms = sar_tx_retrans_timeout_ms(net->sar_txr,
+								is_unicast,
+								payload->ttl);
+		sar_tx->sar = payload;
+		l_queue_push_head(net->sar_out, sar_tx);
+		sar_tx->seg_timeout = l_timeout_create_ms(sar_tx->int_ms,
+						send_next_seg_to, net, NULL);
+		sar_tx->segO = 1;	/* The 0th seg is already sent. */
+		sar_tx->segN = segN;
+	} else {
+		mesh_sar_free(payload);
+	}
+
+	return result;
 }
 
 void mesh_net_send_seg(struct mesh_net *net, uint32_t net_key_id,
@@ -3119,7 +3326,7 @@ bool mesh_net_app_send(struct mesh_net *net, bool frnd_cred, uint16_t src,
 
 	/* Long and sizmic messages *require* segmenting */
 	segmented |= szmic;
-	seg_max = SEG_MAX(segmented, msg_len);
+	seg_max = SEG_MAX(false, segmented, msg_len);
 	segmented |= !!(seg_max);
 
 	/* First enqueue to any Friends and internal models */
@@ -3139,6 +3346,7 @@ bool mesh_net_app_send(struct mesh_net *net, bool frnd_cred, uint16_t src,
 	payload = mesh_sar_new(msg_len);
 	memcpy(payload->buf, msg, msg_len);
 	payload->len = msg_len;
+	payload->ctl = false;
 	payload->src = src;
 	payload->remote = dst;
 	payload->ttl = ttl;
@@ -3150,48 +3358,7 @@ bool mesh_net_app_send(struct mesh_net *net, bool frnd_cred, uint16_t src,
 	payload->seqAuth = seq;
 	payload->segmented = segmented;
 
-	if (segmented) {
-		payload->flags = 0xffffffff >> (31 - seg_max);
-		payload->seqZero = seq & SEQ_ZERO_MASK;
-		payload->id = ++net->sar_id_next;
-
-		/* Single thread SAR messages to same Unicast DST */
-		if (l_queue_find(net->sar_out, match_sar_remote,
-							L_UINT_TO_PTR(dst))) {
-			/* Delay sending Outbound SAR unless prior
-			 * SAR to same DST has completed */
-
-			l_debug("OB-Queued SeqZero: %4.4x", payload->seqZero);
-			l_queue_push_tail(net->sar_queue, payload);
-			return true;
-		}
-	}
-
-	result = true;
-
-	if (!IS_UNICAST(dst) && segmented) {
-		int i;
-
-		for (i = 0; i < 4; i++) {
-			for (seg = 0; seg <= seg_max && result; seg++)
-				result = send_seg(net, cnt, interval, payload,
-									seg);
-		}
-	} else {
-		for (seg = 0; seg <= seg_max && result; seg++)
-			result = send_seg(net, cnt, interval, payload, seg);
-	}
-
-	/* Reliable: Cache; Unreliable: Flush*/
-	if (result && segmented && IS_UNICAST(dst)) {
-		l_queue_push_head(net->sar_out, payload);
-		payload->seg_timeout =
-			l_timeout_create(SEG_TO, outseg_to, net, NULL);
-		payload->msg_timeout =
-			l_timeout_create(MSG_TO, outmsg_to, net, NULL);
-		payload->id = ++net->sar_id_next;
-	} else
-		mesh_sar_free(payload);
+	result = mesh_net_send(net, payload, seg_max);
 
 	return result;
 }
@@ -3243,10 +3410,14 @@ void mesh_net_transport_send(struct mesh_net *net, uint32_t net_key_id,
 				uint16_t dst, const uint8_t *msg,
 				uint16_t msg_len)
 {
-	uint32_t use_seq = seq;
-	uint8_t pkt_len;
-	uint8_t pkt[30];
+	struct mesh_sar *payload;
+	uint8_t opcode, seg_max;
+	bool segmented = false;
 	bool result = false;
+
+	/* Check maximum message length */
+	if (!net || msg_len > 257)
+		return;
 
 	if (!net->src_addr)
 		return;
@@ -3277,36 +3448,38 @@ void mesh_net_transport_send(struct mesh_net *net, uint32_t net_key_id,
 
 	/* Deliver to Local entities if applicable */
 	if (!(dst & 0x8000) && src >= net->src_addr && src <= net->last_addr)
-		result = ctl_received(net, net_key_id, iv_index, ttl,
+		result = ctl_rxed(net, net_key_id, iv_index, ttl,
 					mesh_net_next_seq_num(net), src, dst,
 					msg[0], 0, msg + 1, msg_len - 1);
 
 	if (!net_key_id) {
-		struct mesh_subnet *subnet = l_queue_find(net->subnets,
-				match_key_index, L_UINT_TO_PTR(net_idx));
-		if (!subnet)
-			return;
-
-		net_key_id = subnet->net_key_tx;
-		use_seq = mesh_net_next_seq_num(net);
+		seq = mesh_net_next_seq_num(net);
 
 		if (result || (dst >= net->src_addr && dst <= net->last_addr))
 			return;
+	} else {
+		struct mesh_subnet *subnet = l_queue_find(net->subnets,
+				match_key_id, L_UINT_TO_PTR(net_key_id));
+		if (!subnet)
+			return;
+
+		net_idx = subnet->idx;
 	}
 
-	if (!mesh_crypto_packet_build(true, ttl, use_seq, src, dst, msg[0],
-				false, 0, false, false, 0, 0, 0, msg + 1,
-				msg_len - 1, pkt + 1, &pkt_len))
-		return;
+	payload = mesh_sar_new(msg_len - 1);
+	memcpy(payload->buf, msg + 1, msg_len - 1);
+	payload->len = msg_len - 1;
+	payload->ctl = true;
+	payload->ttl = ttl;
+	payload->src = src;
+	payload->remote = dst;
+	payload->opcode = opcode;
+	payload->net_idx = net_idx;
+	payload->iv_index = iv_index;
+	payload->seqAuth = seq;
+	payload->segmented = segmented;
 
-	if (!net_key_encrypt(net_key_id, iv_index, pkt + 1, pkt_len)) {
-		l_error("Failed to encode packet");
-		return;
-	}
-
-	if (!(IS_UNASSIGNED(dst)))
-		send_msg_pkt(net, net->tx_cnt, net->tx_interval, pkt,
-								pkt_len + 1);
+	mesh_net_send(net, payload, seg_max);
 }
 
 int mesh_net_key_refresh_phase_set(struct mesh_net *net, uint16_t idx,
